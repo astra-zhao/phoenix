@@ -274,6 +274,12 @@ public class SchemaUtil {
         return l3;
     }
 
+    public static byte[] getTableKey(PTable dataTable) {
+        PName tenantId = dataTable.getTenantId();
+        PName schemaName = dataTable.getSchemaName();
+        return getTableKey(tenantId == null ? ByteUtil.EMPTY_BYTE_ARRAY : tenantId.getBytes(), schemaName == null ? ByteUtil.EMPTY_BYTE_ARRAY : schemaName.getBytes(), dataTable.getTableName().getBytes());
+    }
+
     /**
      * Get the key used in the Phoenix metadata row for a table definition
      * @param schemaName
@@ -1051,12 +1057,6 @@ public class SchemaUtil {
     	return table.getRowTimestampColPos()>0;
     }
 
-    public static byte[] getTableKey(PTable dataTable) {
-        PName tenantId = dataTable.getTenantId();
-        PName schemaName = dataTable.getSchemaName();
-        return getTableKey(tenantId == null ? ByteUtil.EMPTY_BYTE_ARRAY : tenantId.getBytes(), schemaName == null ? ByteUtil.EMPTY_BYTE_ARRAY : schemaName.getBytes(), dataTable.getTableName().getBytes());
-    }
-
     public static byte[] getSchemaKey(String schemaName) {
         return SchemaUtil.getTableKey(null, schemaName, MetaDataClient.EMPTY_TABLE);
     }
@@ -1174,7 +1174,8 @@ public class SchemaUtil {
             if (ptr.getLength() < maxLength) {
                 type.pad(ptr, maxLength, column.getSortOrder());
             } else if (ptr.getLength() > maxLength) {
-                throw new DataExceedsCapacityException(tableName + "." + column.getName().getString() + " may not exceed " + maxLength + " bytes (" + type.toObject(byteValue) + ")");
+                throw new DataExceedsCapacityException(column.getDataType(), column.getMaxLength(),
+                        column.getScale(), column.getName().getString());
             }
         }
     }

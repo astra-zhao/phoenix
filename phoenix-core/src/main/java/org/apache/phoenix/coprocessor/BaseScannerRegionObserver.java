@@ -74,9 +74,13 @@ abstract public class BaseScannerRegionObserver extends CompatBaseScannerRegionO
     public static final String GROUP_BY_LIMIT = "_GroupByLimit";
     public static final String LOCAL_INDEX = "_LocalIndex";
     public static final String LOCAL_INDEX_BUILD = "_LocalIndexBuild";
-    // The number of index rows to be rebuild in one RPC call
     public static final String INDEX_REBUILD_PAGING = "_IndexRebuildPaging";
+    // The number of index rows to be rebuild in one RPC call
     public static final String INDEX_REBUILD_PAGE_ROWS = "_IndexRebuildPageRows";
+    public static final String SERVER_PAGING = "_ServerPaging";
+    // The number of rows to be scanned in one RPC call
+    public static final String AGGREGATE_PAGE_SIZE_IN_MS = "_AggregatePageSizeInMs";
+
     // Index verification type done by the index tool
     public static final String INDEX_REBUILD_VERIFY_TYPE = "_IndexRebuildVerifyType";
     public static final String INDEX_RETRY_VERIFY = "_IndexRetryVerify";
@@ -106,6 +110,10 @@ abstract public class BaseScannerRegionObserver extends CompatBaseScannerRegionO
     public static final String RUN_UPDATE_STATS_ASYNC_ATTRIB = "_RunUpdateStatsAsync";
     public static final String SKIP_REGION_BOUNDARY_CHECK = "_SKIP_REGION_BOUNDARY_CHECK";
     public static final String TX_SCN = "_TxScn";
+    public static final String PHOENIX_TTL = "_PhoenixTTL";
+    public static final String MASK_PHOENIX_TTL_EXPIRED = "_MASK_TTL_EXPIRED";
+    public static final String DELETE_PHOENIX_TTL_EXPIRED = "_DELETE_TTL_EXPIRED";
+    public static final String PHOENIX_TTL_SCAN_TABLE_NAME = "_PhoenixTTLScanTableName";
     public static final String SCAN_ACTUAL_START_ROW = "_ScanActualStartRow";
     public static final String REPLAY_WRITES = "_IGNORE_NEWER_MUTATIONS";
     public final static String SCAN_OFFSET = "_RowOffset";

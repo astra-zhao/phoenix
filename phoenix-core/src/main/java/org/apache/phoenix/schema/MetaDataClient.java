@@ -17,12 +17,11 @@
  */
 package org.apache.phoenix.schema;
 
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_TASK_TABLE;
+import static org.apache.phoenix.query.QueryConstants.SYSTEM_SCHEMA_NAME;
 import static org.apache.phoenix.thirdparty.com.google.common.collect.Sets.newLinkedHashSet;
 import static org.apache.phoenix.thirdparty.com.google.common.collect.Sets.newLinkedHashSetWithExpectedSize;
 import static org.apache.phoenix.coprocessor.BaseScannerRegionObserver.RUN_UPDATE_STATS_ASYNC_ATTRIB;
-import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MAJOR_VERSION;
-import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MINOR_VERSION;
-import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_PATCH_NUMBER;
 import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.INDEX_NAME;
 import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.REBUILD_ALL;
 import static org.apache.phoenix.exception.SQLExceptionCode.INSUFFICIENT_MULTI_TENANT_COLUMNS;
@@ -124,7 +123,6 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Timestamp;
 import java.sql.Types;
-import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
@@ -141,6 +139,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.HashSet;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.phoenix.schema.task.SystemTaskParams;
 import org.apache.phoenix.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Admin;
@@ -152,7 +151,6 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.TableDescriptor;
-import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.access.AccessControlClient;
 import org.apache.hadoop.hbase.security.access.Permission;
@@ -174,8 +172,8 @@ import org.apache.phoenix.coprocessor.MetaDataProtocol;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MetaDataMutationResult;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MutationCode;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.SharedTableState;
-import org.apache.phoenix.hbase.index.util.VersionUtil;
 import org.apache.phoenix.schema.stats.GuidePostsInfo;
+import org.apache.phoenix.util.TaskMetaDataServiceCallBack;
 import org.apache.phoenix.util.ViewUtil;
 import org.apache.phoenix.util.JacksonUtil;
 import org.apache.phoenix.exception.SQLExceptionCode;
@@ -233,7 +231,6 @@ import org.apache.phoenix.schema.PTable.LinkType;
 import org.apache.phoenix.schema.PTable.QualifierEncodingScheme;
 import org.apache.phoenix.schema.PTable.QualifierEncodingScheme.QualifierOutOfRangeException;
 import org.apache.phoenix.schema.PTable.ViewType;
-import org.apache.phoenix.schema.stats.GuidePostsInfo;
 import org.apache.phoenix.schema.stats.GuidePostsKey;
 import org.apache.phoenix.schema.stats.StatisticsUtil;
 import org.apache.phoenix.schema.task.Task;
@@ -690,7 +687,7 @@ public class MetaDataClient {
                     // Otherwise, a tenant would be required to create a VIEW first
                     // which is not really necessary unless you want to filter or add
                     // columns
-                    PTable temp = addTableToCache(result);
+                    addTableToCache(result);
                     return result;
                 } else {
                     // if (result.getMutationCode() == MutationCode.NEWER_TABLE_FOUND) {
@@ -840,7 +837,7 @@ public class MetaDataClient {
 
         do {
             List<Pair<byte[], Long>> functionsToFecth = new ArrayList<Pair<byte[], Long>>(functionNames.size());
-            for(int i = 0; i< functionNames.size(); i++) {
+            for (int i = 0; i< functionNames.size(); i++) {
                 functionsToFecth.add(new Pair<byte[], Long>(PVarchar.INSTANCE.toBytes(functionNames.get(i)), functionTimeStamps.get(i)));
             }
             result = connection.getQueryServices().getFunctions(tenantId, functionsToFecth, clientTimeStamp);
@@ -1688,13 +1685,18 @@ public class MetaDataClient {
                 requiredCols.addAll(includedColumns);
                 for (ColumnName colName : requiredCols) {
                     // acquire the mutex using the global physical table name to
-                    // prevent this column from being dropped while the index is being created
+                    // prevent this column from being dropped while the view is being created
+                    String colNameSeparatedByDot = colName.getColumnName()
+                            .replace(QueryConstants.NAMESPACE_SEPARATOR,
+                                     QueryConstants.NAME_SEPARATOR);
+                    // indexed column name have a ':' between the column family and column name
+                    // We would like to have '.' like in other column names
                     boolean acquiredMutex = writeCell(null, physicalSchemaName, physicalTableName,
-                            colName.toString());
+                            colNameSeparatedByDot);
                     if (!acquiredMutex) {
                         throw new ConcurrentTableMutationException(physicalSchemaName, physicalTableName);
                     }
-                    acquiredColumnMutexSet.add(colName.toString());
+                    acquiredColumnMutexSet.add(colNameSeparatedByDot);
                 }
             }
 
@@ -1755,7 +1757,7 @@ public class MetaDataClient {
                 QueryServices.INDEX_ASYNC_BUILD_ENABLED,
                 QueryServicesOptions.DEFAULT_INDEX_ASYNC_BUILD_ENABLED);
         // In async process, we return immediately as the MR job needs to be triggered .
-        if(statement.isAsync() && asyncIndexBuildEnabled) {
+        if (statement.isAsync() && asyncIndexBuildEnabled) {
             return new MutationState(0, 0, connection);
         }
 
@@ -1874,7 +1876,7 @@ public class MetaDataClient {
                 List<PFunction> functions = new ArrayList<PFunction>(1);
                 functions.add(function);
                 result = new MetaDataMutationResult(code, result.getMutationTime(), functions, true);
-                if(function.isReplace()) {
+                if (function.isReplace()) {
                     connection.removeFunction(function.getTenantId(), function.getFunctionName(),
                             result.getMutationTime());
                 }
@@ -2061,15 +2063,16 @@ public class MetaDataClient {
             Long phoenixTTL = PHOENIX_TTL_NOT_DEFINED;
             Long phoenixTTLHighWaterMark = MIN_PHOENIX_TTL_HWM;
             Long phoenixTTLProp = (Long) TableProperty.PHOENIX_TTL.getValue(tableProps);;
-            // Validate VIEW_TTL prop value if set
+            // Validate PHOENIX_TTL prop value if set
             if (phoenixTTLProp != null) {
                 if (phoenixTTLProp < 0) {
                     throw new SQLExceptionInfo.Builder(SQLExceptionCode.ILLEGAL_DATA)
-                            .setMessage(String.format("view = %s, PHOENIX_TTL value should be > 0", tableName ))
+                            .setMessage(String.format("entity = %s, PHOENIX_TTL value should be > 0", tableName ))
                             .build()
                             .buildException();
                 }
 
+                // TODO: PHOENIX_TABLE_TTL
                 if (tableType == VIEW  && parentPhysicalName != null) {
                     TableDescriptor desc = connection.getQueryServices().getTableDescriptor(parentPhysicalName.getBytes());
                     if (desc != null) {
@@ -2081,6 +2084,13 @@ public class MetaDataClient {
                                     .buildException();
                         }
                     }
+                }
+
+                // Cannot set PHOENIX_TTL if parent has already defined it.
+                if (tableType == VIEW  && parent != null && parent.getPhoenixTTL() != PHOENIX_TTL_NOT_DEFINED) {
+                    throw new SQLExceptionInfo.Builder(
+                            SQLExceptionCode.CANNOT_SET_OR_ALTER_PHOENIX_TTL)
+                            .setSchemaName(schemaName).setTableName(tableName).build().buildException();
                 }
 
                 if (tableType != VIEW) {
@@ -2604,6 +2614,9 @@ public class MetaDataClient {
 
             Map<String, Integer> changedCqCounters = new HashMap<>(colDefs.size());
             boolean wasPKDefined = false;
+            // Keep track of all columns that are newly added to a view
+            Set<Integer> viewNewColumnPositions =
+                    Sets.newHashSetWithExpectedSize(colDefs.size());
             for (ColumnDef colDef : colDefs) {
                 rowTimeStampColumnAlreadyFound = checkAndValidateRowTimestampCol(colDef, pkConstraint, rowTimeStampColumnAlreadyFound, tableType);
                 if (colDef.isPK()) { // i.e. the column is declared as CREATE TABLE COLNAME DATATYPE PRIMARY KEY...
@@ -2669,6 +2682,8 @@ public class MetaDataClient {
                 }
                 if (columns.put(column, column) != null) {
                     throw new ColumnAlreadyExistsException(schemaName, tableName, column.getName().getString());
+                } else if (tableType == VIEW) {
+                    viewNewColumnPositions.add(column.getPosition());
                 }
                 if ((colDef.getDataType() == PVarbinary.INSTANCE || colDef.getDataType().isArrayType())
                         && SchemaUtil.isPKColumn(column)
@@ -2860,15 +2875,26 @@ public class MetaDataClient {
                         }
 
                         // if the base table column is referenced in the view
-                        if (isViewColumnReferenced.get(columnPosition)) {
-                            // acquire the mutex using the global physical table name to
-                            // prevent this column from being dropped while the index is being created
-                            boolean acquiredMutex = writeCell(null, parentPhysicalSchemaName, parentPhysicalTableName,
-                                    column.getName().getString());
+                        // or if we are adding a new column during view creation
+                        if (isViewColumnReferenced.get(columnPosition) ||
+                                viewNewColumnPositions.contains(
+                                        columnPosition)) {
+                            // acquire the mutex using the global physical table
+                            // name to prevent this column from being dropped
+                            // while the view is being created or to prevent
+                            // a conflicting column from being added to a parent
+                            // in case the view creation adds new columns
+                            boolean acquiredMutex = writeCell(
+                                    null,
+                                    parentPhysicalSchemaName,
+                                    parentPhysicalTableName,
+                                    column.toString());
                             if (!acquiredMutex) {
-                                throw new ConcurrentTableMutationException(parentPhysicalSchemaName, parentPhysicalTableName);
+                                throw new ConcurrentTableMutationException(
+                                        parentPhysicalSchemaName,
+                                        parentPhysicalTableName);
                             }
-                            acquiredColumnMutexSet.add(column.getName().getString());
+                            acquiredColumnMutexSet.add(column.toString());
                         }
                     }
                     Short keySeq = SchemaUtil.isPKColumn(column) ? ++nextKeySeq : null;
@@ -2960,7 +2986,14 @@ public class MetaDataClient {
             } else {
                 tableUpsert.setBoolean(28, useStatsForParallelizationProp);
             }
-            tableUpsert.setInt(29, viewIndexIdType.getSqlType());
+            if (indexType == IndexType.LOCAL ||
+                    (parent != null && parent.getType() == PTableType.VIEW
+                            && tableType == PTableType.INDEX)) {
+                tableUpsert.setInt(29, viewIndexIdType.getSqlType());
+            } else {
+                tableUpsert.setNull(29, Types.NULL);
+            }
+
             if (phoenixTTL == null || phoenixTTL == PHOENIX_TTL_NOT_DEFINED) {
                 tableUpsert.setNull(30, Types.BIGINT);
                 tableUpsert.setNull(31, Types.BIGINT);
@@ -3013,7 +3046,7 @@ public class MetaDataClient {
             if (code != MutationCode.TABLE_NOT_FOUND) {
                 boolean tableAlreadyExists = handleCreateTableMutationCode(result, code, statement,
                         schemaName, tableName, parent);
-                if(tableAlreadyExists) {
+                if (tableAlreadyExists) {
                     return null;
                 }
             }
@@ -3110,6 +3143,8 @@ public class MetaDataClient {
                     .setViewModifiedPhoenixTTL(tableType ==  PTableType.VIEW &&
                             parent != null && phoenixTTL != null &&
                             parent.getPhoenixTTL() != phoenixTTL)
+                .setLastDDLTimestamp(result.getTable() != null ?
+                    result.getTable().getLastDDLTimestamp() : null)
                     .build();
             result = new MetaDataMutationResult(code, result.getMutationTime(), table, true);
             addTableToCache(result);
@@ -3135,10 +3170,10 @@ public class MetaDataClient {
                  PTable parent) throws SQLException {
         switch(code) {
             case TABLE_ALREADY_EXISTS:
-                if(result.getTable() != null) {
+                if (result.getTable() != null) {
                     addTableToCache(result);
                 }
-                if(!statement.ifNotExists()) {
+                if (!statement.ifNotExists()) {
                     throw new TableAlreadyExistsException(schemaName, tableName, result.getTable());
                 }
                 return true;
@@ -3443,6 +3478,10 @@ public class MetaDataClient {
             }
             throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_MUTATE_TABLE)
             .setSchemaName(schemaName).setTableName(tableName).setFamilyName(familyName).setColumnName(columnName).setMessage(msg).build().buildException();
+        case UNALLOWED_SCHEMA_MUTATION:
+            throw new SQLExceptionInfo.Builder(
+                    SQLExceptionCode.CANNOT_SET_OR_ALTER_PHOENIX_TTL)
+                    .setSchemaName(schemaName).setTableName(tableName).build().buildException();
         case NO_OP:
         case COLUMN_ALREADY_EXISTS:
         case COLUMN_NOT_FOUND:
@@ -3648,7 +3687,7 @@ public class MetaDataClient {
         // if cascade keyword is passed and indexes are provided either implicitly or explicitly
         if (cascade && (indexes == null || !indexes.isEmpty())) {
             indexesPTable = getIndexesPTableForCascade(indexes, table);
-            for(PTable index : indexesPTable) {
+            for (PTable index : indexesPTable) {
                 indexToColumnSizeMap.put(index, index.getColumns().size());
             }
         }
@@ -3669,7 +3708,7 @@ public class MetaDataClient {
             connection.setAutoCommit(false);
 
             List<ColumnDef> columnDefs;
-            if (table.isAppendOnlySchema() || ifNotExists) {
+            if ((table.isAppendOnlySchema() || ifNotExists) && origColumnDefs != null) {
                 // only make the rpc if we are adding new columns
                 columnDefs = Lists.newArrayList();
                 for (ColumnDef columnDef : origColumnDefs) {
@@ -3726,12 +3765,14 @@ public class MetaDataClient {
                 if (addPKColumns) {
                     List<PColumn> currentPKs = table.getPKColumns();
                     PColumn lastPK = currentPKs.get(currentPKs.size()-1);
-                    // Disallow adding columns if the last column in the primary key is VARBIANRY or ARRAY.
+                    // Disallow adding columns if the last column in the primary key is VARBIANRY
+                    // or ARRAY.
                     if (lastPK.getDataType() == PVarbinary.INSTANCE || lastPK.getDataType().isArrayType()) {
                         throw new SQLExceptionInfo.Builder(SQLExceptionCode.VARBINARY_LAST_PK)
                         .setColumnName(lastPK.getName().getString()).build().buildException();
                     }
-                    // Disallow adding columns if last column in the primary key is fixed width and nullable.
+                    // Disallow adding columns if last column in the primary key is fixed width
+                    // and nullable.
                     if (lastPK.isNullable() && lastPK.getDataType().isFixedWidth()) {
                         throw new SQLExceptionInfo.Builder(SQLExceptionCode.NULLABLE_FIXED_WIDTH_LAST_PK)
                         .setColumnName(lastPK.getName().getString()).build().buildException();
@@ -3755,9 +3796,9 @@ public class MetaDataClient {
                     String addColumnSqlToUse = INSERT_COLUMN_CREATE_TABLE;
                     try (PreparedStatement colUpsert = connection.prepareStatement(addColumnSqlToUse)) {
                         short nextKeySeq = SchemaUtil.getMaxKeySeq(table);
-                        for( ColumnDef colDef : columnDefs) {
+                        for ( ColumnDef colDef : columnDefs) {
                             if (colDef != null && !colDef.isNull()) {
-                                if(colDef.isPK()) {
+                                if (colDef.isPK()) {
                                     throw new SQLExceptionInfo.Builder(SQLExceptionCode.NOT_NULLABLE_COLUMN_IN_ROW_KEY)
                                     .setColumnName(colDef.getColumnDefName().getColumnName()).build().buildException();
                                 } else if (!willBeImmutableRows) {
@@ -3980,11 +4021,11 @@ public class MetaDataClient {
                     // prevent creating the same column on a table or view with
                     // a conflicting type etc
                     boolean acquiredMutex = writeCell(null, physicalSchemaName, physicalTableName,
-                        pColumn.getName().getString());
+                        pColumn.toString());
                     if (!acquiredMutex) {
                         throw new ConcurrentTableMutationException(physicalSchemaName, physicalTableName);
                     }
-                    acquiredColumnMutexSet.add(pColumn.getName().getString());
+                    acquiredColumnMutexSet.add(pColumn.toString());
                 }
                 MetaDataMutationResult result = connection.getQueryServices().addColumn(tableMetaData, table,
                         getParentTable(table), properties, colFamiliesForPColumnsToBeAdded, columns);
@@ -4092,7 +4133,7 @@ public class MetaDataClient {
 
         // when indexes is null, that means ALL keyword is passed and
         // we ll collect all global indexes for cascading
-        if(indexes == null) {
+        if (indexes == null) {
             indexesPTable.addAll(table.getIndexes());
             for (PTable index : table.getIndexes()) {
                 // a child view has access to its parents indexes,
@@ -4112,7 +4153,7 @@ public class MetaDataClient {
             // if all the names in parameter list are correct, indexesParam list should be empty
             // by end of the loop
             for (PTable index : table.getIndexes()) {
-                if(index.getIndexType().equals(IndexType.LOCAL)) {
+                if (index.getIndexType().equals(IndexType.LOCAL)) {
                     throw new SQLExceptionInfo
                             .Builder(SQLExceptionCode.NOT_SUPPORTED_CASCADE_FEATURE_LOCAL_INDEX)
                             .setTableName(index.getName().getString())
@@ -4153,7 +4194,10 @@ public class MetaDataClient {
         // TODO: add support to specify tenant owned indexes in the DDL statement with CASCADE executed with Global connection
         for (PTable index : indexesPTable) {
             int iPos = indexToColumnSizeMap.get(index);
-            PColumn iColumn = newColumn(iPos, indexColDef, null, "", false, null, willBeImmutableRows);
+            EncodedCQCounter cqCounterToUse = index.getEncodedCQCounter();
+            Integer encodedCQ = index.isAppendOnlySchema() ? Integer.valueOf(ENCODED_CQ_COUNTER_INITIAL_VALUE + iPos) : cqCounterToUse.getNextQualifier(familyName) + iPos;
+            byte[] columnQualifierBytes = EncodedColumnsUtil.getColumnQualifierBytes(indexColDef.getColumnDefName().getColumnName(), encodedCQ, index, indexColDef.isPK());
+            PColumn iColumn = newColumn(iPos, indexColDef, null, index.getDefaultFamilyName() == null ? null : index.getDefaultFamilyName().getString(), false, columnQualifierBytes, willBeImmutableRows);
             indexColumn.put(index, iColumn);
             indexToColumnSizeMap.put(index, iPos+1);
         }
@@ -4183,7 +4227,7 @@ public class MetaDataClient {
         buf.append("(" +
                 TENANT_ID + "," + TABLE_SCHEM + "," + TABLE_NAME + "," +
                 COLUMN_NAME + ", " + COLUMN_FAMILY + ") IN (");
-        for(PColumn columnToDrop : columnsToDrop) {
+        for (PColumn columnToDrop : columnsToDrop) {
             buf.append("('" + tenantId + "'");
             buf.append(",'" + schemaName + "'");
             buf.append(",'" + tableName + "'");
@@ -4209,7 +4253,7 @@ public class MetaDataClient {
         colUpdate.setString(3, tableName);
         for (int i = columnsToDrop.get(columnsToDropIndex).getPosition() + 1; i < table.getColumns().size(); i++) {
             PColumn column = table.getColumns().get(i);
-            if(columnsToDrop.contains(column)) {
+            if (columnsToDrop.contains(column)) {
                 columnsToDropIndex++;
                 continue;
             }
@@ -4279,7 +4323,7 @@ public class MetaDataClient {
                 physicalTableName = SchemaUtil.getTableNameFromFullName(physicalName.getString());
 
                 List<ColumnName> columnRefs = statement.getColumnRefs();
-                if(columnRefs == null) {
+                if (columnRefs == null) {
                     columnRefs = Lists.newArrayListWithCapacity(0);
                 }
                 List<ColumnRef> columnsToDrop = Lists.newArrayListWithExpectedSize(columnRefs.size() + table.getIndexes().size());
@@ -4287,7 +4331,7 @@ public class MetaDataClient {
                 List<Mutation> tableMetaData = Lists.newArrayListWithExpectedSize((table.getIndexes().size() + 1) * (1 + table.getColumns().size() - columnRefs.size()));
                 List<PColumn>  tableColumnsToDrop = Lists.newArrayListWithExpectedSize(columnRefs.size());
 
-                for(ColumnName column : columnRefs) {
+                for (ColumnName column : columnRefs) {
                     ColumnRef columnRef = null;
                     try {
                         columnRef = resolver.resolveColumn(null, column.getFamilyName(), column.getColumnName());
@@ -4312,11 +4356,12 @@ public class MetaDataClient {
                                 .setColumnName(columnToDrop.getName().getString()).build().buildException();
                     }
                     columnsToDrop.add(new ColumnRef(columnRef.getTableRef(), columnToDrop.getPosition()));
-                    boolean acquiredMutex = writeCell(null, physicalSchemaName, physicalTableName, columnToDrop.getName().getString());
+                    boolean acquiredMutex = writeCell(null, physicalSchemaName,
+                            physicalTableName, columnToDrop.toString());
                     if (!acquiredMutex) {
                         throw new ConcurrentTableMutationException(physicalSchemaName, physicalTableName);
                     }
-                    acquiredColumnMutexSet.add(columnToDrop.getName().getString());
+                    acquiredColumnMutexSet.add(columnToDrop.toString());
                 }
 
                 dropColumnMutations(table, tableColumnsToDrop);
@@ -4328,7 +4373,7 @@ public class MetaDataClient {
                     List<PColumn> indexColumnsToDrop = Lists.newArrayListWithExpectedSize(columnRefs.size());
                     Set<Pair<String, String>> indexedColsInfo = indexMaintainer.getIndexedColumnInfo();
                     Set<ColumnReference> coveredCols = indexMaintainer.getCoveredColumns();
-                    for(PColumn columnToDrop : tableColumnsToDrop) {
+                    for (PColumn columnToDrop : tableColumnsToDrop) {
                         Pair<String, String> columnToDropInfo = new Pair<>(columnToDrop.getFamilyName().getString(), columnToDrop.getName().getString());
                         ColumnReference colDropRef = new ColumnReference(columnToDrop.getFamilyName() == null ? null
                                 : columnToDrop.getFamilyName().getBytes(), columnToDrop.getColumnQualifierBytes());
@@ -4348,7 +4393,7 @@ public class MetaDataClient {
                             removedIndexTableOrColumn = true;
                         }
                     }
-                    if(!indexColumnsToDrop.isEmpty()) {
+                    if (!indexColumnsToDrop.isEmpty()) {
                         long indexTableSeqNum = incrementTableSeqNum(index, index.getType(), -indexColumnsToDrop.size(), null, null, null);
                         dropColumnMutations(index, indexColumnsToDrop);
                         long clientTimestamp = MutationState.getTableTimestamp(timeStamp, connection.getSCN());
@@ -4414,10 +4459,9 @@ public class MetaDataClient {
                     // client-side cache as it would be too painful. Just let it pull it over from
                     // the server when needed.
                     if (tableColumnsToDrop.size() > 0) {
-                        if (removedIndexTableOrColumn)
-                            connection.removeTable(tenantId, tableName, table.getParentName() == null ? null : table.getParentName().getString(), table.getTimeStamp());
-                        else
-                            connection.removeColumn(tenantId, SchemaUtil.getTableName(schemaName, tableName) , tableColumnsToDrop, result.getMutationTime(), seqNum, TransactionUtil.getResolvedTime(connection, result));
+                        //need to remove the cached table because the DDL timestamp changed. We
+                        // also need to remove it if we dropped an indexed column
+                        connection.removeTable(tenantId, tableName, table.getParentName() == null ? null : table.getParentName().getString(), table.getTimeStamp());
                     }
                     // If we have a VIEW, then only delete the metadata, and leave the table data alone
                     if (table.getType() != PTableType.VIEW) {
@@ -4556,7 +4600,7 @@ public class MetaDataClient {
         boolean wasAutoCommit = connection.getAutoCommit();
         try {
             String dataTableName = statement.getTableName();
-            String indexName = statement.getTable().getName().getTableName();
+            final String indexName = statement.getTable().getName().getTableName();
             boolean isAsync = statement.isAsync();
             boolean isRebuildAll = statement.isRebuildAll();
             String tenantId = connection.getTenantId() == null ? null : connection.getTenantId().getString();
@@ -4587,7 +4631,7 @@ public class MetaDataClient {
             TableRef indexRef = FromCompiler.getResolver(statement, connection).getTables().get(0);
             PreparedStatement tableUpsert = null;
             try {
-                if(newIndexState == PIndexState.ACTIVE){
+                if (newIndexState == PIndexState.ACTIVE){
                     tableUpsert = connection.prepareStatement(UPDATE_INDEX_STATE_TO_ACTIVE);
                 }else{
                     tableUpsert = connection.prepareStatement(UPDATE_INDEX_STATE);
@@ -4597,12 +4641,12 @@ public class MetaDataClient {
                 tableUpsert.setString(3, indexName);
                 tableUpsert.setString(4, newIndexState.getSerializedValue());
                 tableUpsert.setLong(5, 0);
-                if(newIndexState == PIndexState.ACTIVE){
+                if (newIndexState == PIndexState.ACTIVE){
                     tableUpsert.setLong(6, 0);
                 }
                 tableUpsert.execute();
             } finally {
-                if(tableUpsert != null) {
+                if (tableUpsert != null) {
                     tableUpsert.close();
                 }
             }
@@ -4645,11 +4689,32 @@ public class MetaDataClient {
                                 }};
                                 try {
                                     String json = JacksonUtil.getObjectWriter().writeValueAsString(props);
-                                    Task.addTask(connection, PTable.TaskType.INDEX_REBUILD,
-                                            tenantId, schemaName,
-                                            dataTableName, PTable.TaskStatus.CREATED.toString(),
-                                            json, null, ts, null, true);
-                                    connection.commit();
+                                    List<Mutation> sysTaskUpsertMutations = Task.getMutationsForAddTask(new SystemTaskParams.SystemTaskParamsBuilder()
+                                        .setConn(connection)
+                                        .setTaskType(
+                                            PTable.TaskType.INDEX_REBUILD)
+                                        .setTenantId(tenantId)
+                                        .setSchemaName(schemaName)
+                                        .setTableName(dataTableName)
+                                        .setTaskStatus(
+                                            PTable.TaskStatus.CREATED.toString())
+                                        .setData(json)
+                                        .setPriority(null)
+                                        .setStartTs(ts)
+                                        .setEndTs(null)
+                                        .setAccessCheckEnabled(true)
+                                        .build());
+                                    byte[] rowKey = sysTaskUpsertMutations
+                                        .get(0).getRow();
+                                    MetaDataMutationResult metaDataMutationResult =
+                                        Task.taskMetaDataCoprocessorExec(connection, rowKey,
+                                            new TaskMetaDataServiceCallBack(sysTaskUpsertMutations));
+                                    if (MutationCode.UNABLE_TO_UPSERT_TASK.equals(
+                                            metaDataMutationResult.getMutationCode())) {
+                                        throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNABLE_TO_UPSERT_TASK)
+                                          .setSchemaName(SYSTEM_SCHEMA_NAME)
+                                          .setTableName(SYSTEM_TASK_TABLE).build().buildException();
+                                    }
                                 } catch (IOException e) {
                                     throw new SQLException("Exception happened while adding a System.Task" + e.toString());
                                 }
@@ -4723,22 +4788,20 @@ public class MetaDataClient {
         }
     }
 
-    private PTable addTableToCache(MetaDataMutationResult result) throws SQLException {
-        return addTableToCache(result, TransactionUtil.getResolvedTime(connection, result));
+    private void addTableToCache(MetaDataMutationResult result) throws SQLException {
+        addTableToCache(result, TransactionUtil.getResolvedTime(connection, result));
     }
 
-    private PTable addTableToCache(MetaDataMutationResult result, long timestamp) throws SQLException {
+    private void addTableToCache(MetaDataMutationResult result, long timestamp) throws SQLException {
         addColumnsAndIndexesFromAncestors(result, null, false);
         PTable table = result.getTable();
         connection.addTable(table, timestamp);
-        return table;
     }
 
-    private List<PFunction> addFunctionToCache(MetaDataMutationResult result) throws SQLException {
-        for(PFunction function: result.getFunctions()) {
+    private void addFunctionToCache(MetaDataMutationResult result) throws SQLException {
+        for (PFunction function: result.getFunctions()) {
             connection.addFunction(function);
         }
-        return result.getFunctions();
     }
 
     private void addSchemaToCache(MetaDataMutationResult result) throws SQLException {
@@ -5276,6 +5339,7 @@ public class MetaDataClient {
         public void setTransactionProvider(TransactionFactory.Provider transactionProvider) {
             this.transactionProvider = transactionProvider;
         }
+
         public Long getPhoenixTTL() { return phoenixTTL; }
 
         public void setPhoenixTTL(Long phoenixTTL) { this.phoenixTTL = phoenixTTL; }

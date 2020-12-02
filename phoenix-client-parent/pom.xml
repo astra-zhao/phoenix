@@ -155,7 +155,8 @@
                 <exclude>org/apache/hbase/**</exclude>
                 <!-- Phoenix classes -->
                 <exclude>org/apache/phoenix/**</exclude>
-                <!-- Do want/need to expose Omid and Tephra as well ? -->
+                <exclude>org/apache/omid/**</exclude>
+                <!-- Do want/need to expose Tephra as well ? -->
               </excludes>
             </relocation>
             <relocation>
